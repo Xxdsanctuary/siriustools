@@ -1,147 +1,365 @@
+"""
+Portfolio Optimization Engine for Cargill-SMU Datathon 2026
+============================================================
+Optimizes vessel-cargo allocation to maximize total portfolio profit.
+
+Now uses data_loader.py for accurate vessel/cargo data from PPTX.
+
+Author: Team Sirius
+Date: January 2026
+"""
+
 import pandas as pd
+import numpy as np
 import itertools
-from freight_calculator import Vessel, Cargo, calculate_voyage_profit, get_distance
+from datetime import timedelta
+from pathlib import Path
 
-# --- 1. DATA SETUP (Based on PPTX Sources 103-421) ---
+# Import data loader
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from data_loader import load_all_data, get_distance
 
-# Load Distances (Assuming CSV is in same dir)
-# You must ensure 'Port Distances.csv' is accessible
-try:
-    dist_df = pd.read_csv('Port Distances.csv')
-except:
-    dist_df = pd.DataFrame(columns=['PORT_NAME_FROM', 'PORT_NAME_TO', 'DISTANCE'])
-    print("WARNING: Distances CSV not found. Distances will default to 0/Safety.")
+# =============================================================================
+# LOAD DATA FROM DATA_LOADER (Correct values from PPTX)
+# =============================================================================
 
-# Current Market Bunker Prices (Approx from PPTX Forward Curves Source 505)
-VLSFO_PRICE = 490.0
-MGO_PRICE = 650.0
+print("Loading data from data_loader...")
+DATA = load_all_data()
 
-# CARGILL FLEET
-fleet = [
-    Vessel("Ann Bell", 180803, 13.5, 14.5, 60.0, 2.0, 55.0, 2.0, 2.0, 3.0, "Qingdao", "2026-02-25"),
-    Vessel("Ocean Horizon", 181550, 13.8, 14.8, 61.0, 1.8, 56.5, 1.8, 1.8, 3.2, "Map Ta Phut", "2026-03-01"),
-    Vessel("Pacific Glory", 182320, 13.5, 14.2, 59.0, 1.9, 54.0, 1.9, 2.0, 3.0, "Gwangyang", "2026-03-10"),
-    Vessel("Golden Ascent", 179965, 13.0, 14.0, 58.0, 2.0, 53.0, 2.0, 1.9, 3.1, "Fangcheng", "2026-03-08")
-]
+# Extract dataframes
+VESSELS_DF = DATA['vessels']
+CARGOES_DF = DATA['cargoes']
+DISTANCE_LOOKUP = DATA['distance_lookup']
+BUNKER_PRICES = DATA['bunker_prices']
 
-# CARGILL COMMITTED CARGOES (Must be moved)
-# Note: For optimization, we treat these as "Jobs".
-committed_cargoes = [
-    Cargo("EGA Bauxite", 180000, "Kamsar", "Qingdao", 30000, 25000, 23.00, 0.5, 0.5, 0, 0, 0.0125, "2026-04-02"),
-    Cargo("BHP Iron Ore", 160000, "Port Hedland", "Lianyungang", 80000, 30000, 9.00, 0.5, 1.0, 260000, 120000, 0.0375, "2026-03-07"),
-    Cargo("CSN Iron Ore", 180000, "Itaguai", "Qingdao", 60000, 30000, 22.30, 0.25, 1.0, 75000, 90000, 0.0375, "2026-04-01")
-]
+# Get bunker prices (Singapore as default)
+VLSFO_PRICE = BUNKER_PRICES[BUNKER_PRICES['location'] == 'SINGAPORE']['vlsfo'].values[0]
+MGO_PRICE = BUNKER_PRICES[BUNKER_PRICES['location'] == 'SINGAPORE']['mgo'].values[0]
 
-# MARKET CARGOES (Optional - Opportunity to boost profit)
-market_cargoes = [
-    Cargo("Rio Tinto Iron", 170000, "Dampier", "Qingdao", 80000, 30000, 10.50, 0.5, 1.0, 240000, 0, 0.0375, "2026-03-12", is_committed=False),
-    Cargo("Vale Iron", 190000, "Ponta da Madeira", "Caofeidian", 60000, 30000, 21.50, 0.5, 1.0, 75000, 95000, 0.0375, "2026-04-03", is_committed=False),
-    # Add more market cargoes from PPTX here...
-]
+print(f"VLSFO Price: ${VLSFO_PRICE}/MT")
+print(f"MGO Price: ${MGO_PRICE}/MT")
 
-# MARKET VESSELS (Can be hired to cover Committed Cargoes)
-# Simplified: We treat hiring a market vessel as a "Cost" to cover a commitment.
-# We estimate the cost to charter a market vessel for a specific route.
-# For simplicity in this logic, we assume we can charter a market vessel at a generic daily rate + fuel 
-# OR use the specific "Market Vessels" list in PPTX and calculate their specific cost.
-# Here, I'll use a simplified 'Spot Charter Cost' estimator function.
+# =============================================================================
+# CALCULATION FUNCTIONS
+# =============================================================================
 
-def estimate_market_charter_cost(cargo, distance_df):
+def calculate_voyage_profit(vessel: pd.Series, cargo: pd.Series, 
+                            use_eco_speed: bool = True,
+                            weather_margin: float = 0.05) -> dict:
     """
-    Estimates cost to outsource a cargo to a third-party market vessel.
-    This is effectively Negative Profit (Cost).
+    Calculate voyage profit for a vessel-cargo combination.
+    
+    Args:
+        vessel: Series from vessels DataFrame
+        cargo: Series from cargoes DataFrame
+        use_eco_speed: Use economical speed (True) or warranted speed (False)
+        weather_margin: Additional time buffer for weather (default 5%)
+    
+    Returns:
+        Dictionary with voyage results
     """
-    # Use an average Market Vessel profile (Reference PPTX "Atlantic Fortune")
-    avg_speed = 13.0
-    avg_cons = 45.0 # Eco speed cons
-    market_daily_hire = 18000 # Market Rate Assumption (from FFA or context)
     
-    dist = get_distance("Singapore", cargo.load_port, distance_df) # Ballast from Hub
-    dist_laden = get_distance(cargo.load_port, cargo.disch_port, distance_df)
+    # 1. Get distances
+    dist_ballast = get_distance(vessel['current_port'], cargo['load_port'], DISTANCE_LOOKUP)
+    dist_laden = get_distance(cargo['load_port'], cargo['discharge_port'], DISTANCE_LOOKUP)
     
-    days = ((dist + dist_laden) / (avg_speed * 24)) + 5 # +5 port days
+    if dist_ballast is None or dist_laden is None:
+        return {
+            "vessel": vessel['vessel_name'],
+            "cargo": cargo['cargo_id'],
+            "is_feasible": False,
+            "feasibility_notes": f"Distance not found",
+            "profit": -999999999,
+            "tce": -999999999
+        }
     
-    fuel_cost = days * avg_cons * VLSFO_PRICE
-    hire_cost = days * market_daily_hire
+    # 2. Get speeds and consumption based on mode
+    if use_eco_speed:
+        speed_ballast = vessel['speed_ballast_eco']
+        speed_laden = vessel['speed_laden_eco']
+        cons_ballast = vessel['consumption_ballast_eco_vlsf']
+        cons_laden = vessel['consumption_laden_eco_vlsf']
+    else:
+        speed_ballast = vessel['speed_ballast_warranted']
+        speed_laden = vessel['speed_laden_warranted']
+        cons_ballast = vessel['consumption_ballast_warranted_vlsf']
+        cons_laden = vessel['consumption_laden_warranted_vlsf']
     
-    total_outsource_cost = fuel_cost + hire_cost + cargo.port_cost_load + cargo.port_cost_disch
+    mgo_cons = vessel['consumption_mgo_sea']
+    port_cons = vessel['consumption_port_working_vlsf']
     
-    # Revenue is still ours, but we pay the ship. 
-    # Profit = Revenue - Outsource_Cost
-    revenue = cargo.quantity * cargo.freight_rate
+    # 3. Calculate sea time (days)
+    days_ballast = (dist_ballast / (speed_ballast * 24)) * (1 + weather_margin)
+    days_laden = (dist_laden / (speed_laden * 24)) * (1 + weather_margin)
+    
+    # 4. Calculate port time (days)
+    cargo_qty = min(vessel['dwt'], cargo['quantity'] * 1.05)  # Max within 5% tolerance
+    
+    days_load = (cargo_qty / cargo['load_rate']) + (cargo['load_turn_time'] / 24)
+    days_discharge = (cargo_qty / cargo['discharge_rate']) + (cargo['discharge_turn_time'] / 24)
+    
+    # Add 1 day buffer at each port for waiting
+    days_load += 1
+    days_discharge += 1
+    
+    total_days = days_ballast + days_laden + days_load + days_discharge
+    
+    # 5. Check laycan feasibility
+    arrival_date = vessel['etd'] + timedelta(days=days_ballast)
+    is_feasible = arrival_date <= cargo['laycan_end']
+    feasibility_notes = "Feasible" if is_feasible else f"Arrives {arrival_date.date()} > laycan end {cargo['laycan_end'].date()}"
+    
+    # 6. Calculate fuel consumption
+    vlsfo_sea = (days_ballast * cons_ballast) + (days_laden * cons_laden)
+    vlsfo_port = (days_load + days_discharge) * port_cons
+    total_vlsfo = vlsfo_sea + vlsfo_port
+    
+    total_mgo = (days_ballast + days_laden) * mgo_cons
+    
+    # 7. Calculate costs
+    fuel_cost = (total_vlsfo * VLSFO_PRICE) + (total_mgo * MGO_PRICE)
+    port_cost = cargo['port_cost_load'] + cargo['port_cost_discharge']
+    
+    # 8. Calculate revenue
+    gross_revenue = cargo_qty * cargo['freight_rate']
+    commission = gross_revenue * (cargo['commission_pct'] / 100)
+    
+    # 9. Calculate profit and TCE
+    total_cost = fuel_cost + port_cost + commission
+    net_profit = gross_revenue - total_cost
+    tce = net_profit / total_days if total_days > 0 else 0
+    
+    return {
+        "vessel": vessel['vessel_name'],
+        "vessel_type": vessel['vessel_type'],
+        "cargo": cargo['cargo_id'],
+        "cargo_type": cargo['cargo_type'],
+        "route": f"{cargo['load_port']} -> {cargo['discharge_port']}",
+        "is_feasible": is_feasible,
+        "feasibility_notes": feasibility_notes,
+        "dist_ballast": round(dist_ballast, 0),
+        "dist_laden": round(dist_laden, 0),
+        "days_ballast": round(days_ballast, 1),
+        "days_laden": round(days_laden, 1),
+        "days_port": round(days_load + days_discharge, 1),
+        "total_days": round(total_days, 1),
+        "cargo_qty": round(cargo_qty, 0),
+        "revenue": round(gross_revenue, 0),
+        "fuel_cost": round(fuel_cost, 0),
+        "port_cost": round(port_cost, 0),
+        "commission": round(commission, 0),
+        "total_cost": round(total_cost, 0),
+        "profit": round(net_profit, 0),
+        "tce": round(tce, 0)
+    }
+
+
+def estimate_market_charter_cost(cargo: pd.Series) -> float:
+    """
+    Estimate cost to outsource a cargo to a market vessel.
+    Used when a committed cargo cannot be carried by Cargill fleet.
+    """
+    # Use average market vessel profile
+    avg_speed = 12.5  # Eco speed
+    avg_cons = 50.0   # MT/day
+    market_hire = 18454  # Baltic 5TC rate from PPTX
+    
+    # Assume ballast from Singapore (major hub)
+    dist_ballast = get_distance('SINGAPORE', cargo['load_port'], DISTANCE_LOOKUP) or 3000
+    dist_laden = get_distance(cargo['load_port'], cargo['discharge_port'], DISTANCE_LOOKUP) or 5000
+    
+    total_days = ((dist_ballast + dist_laden) / (avg_speed * 24)) + 7  # +7 port days
+    
+    fuel_cost = total_days * avg_cons * VLSFO_PRICE
+    hire_cost = total_days * market_hire
+    port_cost = cargo['port_cost_load'] + cargo['port_cost_discharge']
+    
+    total_outsource_cost = fuel_cost + hire_cost + port_cost
+    
+    # Revenue is still ours, but we pay the charter
+    revenue = cargo['quantity'] * cargo['freight_rate']
     return revenue - total_outsource_cost
 
-# --- 2. OPTIMIZATION ENGINE ---
 
-def optimize_portfolio():
-    print("Starting Portfolio Optimization...")
+# =============================================================================
+# OPTIMIZATION ENGINE
+# =============================================================================
+
+def optimize_portfolio(include_market_cargoes: bool = True, 
+                       verbose: bool = True) -> pd.DataFrame:
+    """
+    Find optimal vessel-cargo allocation to maximize portfolio profit.
     
-    # We have 4 Vessels. They need 4 Jobs.
-    # Jobs pool = 3 Committed Cargoes + Market Cargoes.
-    # BUT: If a Committed Cargo is NOT picked by a Cargill Vessel, we MUST pay for a Market Vessel.
+    Strategy:
+    1. Generate all permutations of cargoes for our 4 vessels
+    2. Calculate P&L for each allocation
+    3. For unassigned committed cargoes, add outsourcing cost
+    4. Return the allocation with maximum total profit
     
-    # Strategy:
-    # 1. Generate all permutations of 4 cargoes from the (Committed + Market) pool.
-    # 2. Assign them to the 4 vessels.
-    # 3. Calculate P&L for these 4 assignments.
-    # 4. Check which Committed Cargoes were LEFT OUT.
-    # 5. Subtract the cost of outsourcing those left-out committed cargoes.
-    # 6. Result = Net Portfolio Profit.
+    Args:
+        include_market_cargoes: Whether to consider market cargoes
+        verbose: Print progress and results
     
-    all_potential_cargoes = committed_cargoes + market_cargoes
+    Returns:
+        DataFrame with optimal allocation details
+    """
+    if verbose:
+        print("\n" + "="*60)
+        print("PORTFOLIO OPTIMIZATION")
+        print("="*60)
     
-    # Generate all combinations of 4 cargoes to assign to our 4 ships
-    # (Note: Permutations because which ship takes which cargo matters due to position/speed)
+    # Get Cargill vessels only
+    cargill_vessels = VESSELS_DF[VESSELS_DF['vessel_type'] == 'cargill'].reset_index(drop=True)
     
-    # Limit for performance: If lists are huge, use linear_sum_assignment. 
-    # Since n=4 vessels and m~6 cargoes, permutations is fine (~360 combos).
-    import itertools
+    # Get cargoes
+    cargill_cargoes = CARGOES_DF[CARGOES_DF['cargo_type'] == 'cargill'].reset_index(drop=True)
+    
+    if include_market_cargoes:
+        market_cargoes = CARGOES_DF[CARGOES_DF['cargo_type'] == 'market'].reset_index(drop=True)
+        all_cargoes = pd.concat([cargill_cargoes, market_cargoes], ignore_index=True)
+    else:
+        all_cargoes = cargill_cargoes
+    
+    if verbose:
+        print(f"\nVessels: {len(cargill_vessels)} Cargill vessels")
+        print(f"Cargoes: {len(cargill_cargoes)} committed + {len(all_cargoes) - len(cargill_cargoes)} market")
+    
+    n_vessels = len(cargill_vessels)
     
     best_profit = -float('inf')
     best_allocation = []
     
-    # Permutations of length 4 from the cargo pool
-    for cargo_subset in itertools.permutations(all_potential_cargoes, 4):
+    # Generate all permutations of n_vessels cargoes
+    cargo_indices = list(range(len(all_cargoes)))
+    
+    for cargo_combo in itertools.permutations(cargo_indices, n_vessels):
+        current_profit = 0
+        current_allocation = []
         
-        current_run_profit = 0
-        current_allocation_details = []
-        
-        # A. Calculate Profit for Own Fleet
-        for i, vessel in enumerate(fleet):
-            cargo = cargo_subset[i]
-            res = calculate_voyage_profit(vessel, cargo, dist_df, VLSFO_PRICE, MGO_PRICE)
-            current_run_profit += res['profit']
-            current_allocation_details.append(res)
+        # A. Calculate profit for each vessel-cargo pair
+        for i, cargo_idx in enumerate(cargo_combo):
+            vessel = cargill_vessels.iloc[i]
+            cargo = all_cargoes.iloc[cargo_idx]
             
-        # B. Handle Unassigned Committed Cargoes
-        # Identify which committed cargoes are NOT in the current cargo_subset
-        assigned_names = [c.name for c in cargo_subset]
+            result = calculate_voyage_profit(vessel, cargo)
+            
+            # Only count feasible voyages
+            if result['is_feasible']:
+                current_profit += result['profit']
+            else:
+                current_profit += -1000000  # Heavy penalty for infeasible
+            
+            current_allocation.append(result)
         
-        for comm_c in committed_cargoes:
-            if comm_c.name not in assigned_names:
-                # We failed to carry this ourselves. We must outsource it.
-                outsource_pnl = estimate_market_charter_cost(comm_c, dist_df)
-                current_run_profit += outsource_pnl # Add the (likely small or negative) profit from outsourcing
-                current_allocation_details.append({
+        # B. Handle unassigned committed cargoes (must outsource)
+        assigned_cargo_ids = [all_cargoes.iloc[idx]['cargo_id'] for idx in cargo_combo]
+        
+        for _, comm_cargo in cargill_cargoes.iterrows():
+            if comm_cargo['cargo_id'] not in assigned_cargo_ids:
+                outsource_profit = estimate_market_charter_cost(comm_cargo)
+                current_profit += outsource_profit
+                current_allocation.append({
                     "vessel": "MARKET CHARTER",
-                    "cargo": comm_c.name,
-                    "profit": outsource_pnl,
+                    "cargo": comm_cargo['cargo_id'],
+                    "route": f"{comm_cargo['load_port']} -> {comm_cargo['discharge_port']}",
+                    "is_feasible": True,
+                    "feasibility_notes": "Outsourced to market vessel",
+                    "profit": round(outsource_profit, 0),
                     "tce": 0,
-                    "notes": "Outsourced"
+                    "total_days": 0
                 })
         
-        # C. Update Maximum
-        if current_run_profit > best_profit:
-            best_profit = current_run_profit
-            best_allocation = current_allocation_details
+        # C. Update best if this is better
+        if current_profit > best_profit:
+            best_profit = current_profit
+            best_allocation = current_allocation
+    
+    # Convert to DataFrame
+    results_df = pd.DataFrame(best_allocation)
+    
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"OPTIMAL ALLOCATION - Total Profit: ${best_profit:,.0f}")
+        print(f"{'='*60}")
+        print(f"\n{'VESSEL':<18} | {'CARGO':<12} | {'ROUTE':<30} | {'PROFIT':>12} | {'TCE':>10}")
+        print("-"*90)
+        
+        for _, row in results_df.iterrows():
+            route = row.get('route', 'N/A')[:28]
+            print(f"{row['vessel']:<18} | {row['cargo']:<12} | {route:<30} | ${row['profit']:>10,.0f} | ${row.get('tce', 0):>8,.0f}")
+        
+        print("-"*90)
+        print(f"{'TOTAL':<18} | {'':<12} | {'':<30} | ${best_profit:>10,.0f} |")
+    
+    return results_df
 
-    # --- 3. OUTPUT RESULTS ---
-    print(f"\nOptimization Complete. Max Portfolio Profit: ${best_profit:,.2f}")
-    print("-" * 60)
-    print(f"{'VESSEL':<20} | {'CARGO':<20} | {'PROFIT':<15} | {'TCE':<10}")
-    print("-" * 60)
-    for row in best_allocation:
-        print(f"{row['vessel']:<20} | {row['cargo']:<20} | ${row['profit']:,.0f} | ${row['tce']:,.0f}")
+
+# =============================================================================
+# SCENARIO ANALYSIS
+# =============================================================================
+
+def bunker_sensitivity_analysis(price_range: tuple = (0.8, 1.3), steps: int = 10):
+    """
+    Analyze how bunker price changes affect the optimal allocation.
+    """
+    global VLSFO_PRICE, MGO_PRICE
+    
+    original_vlsfo = VLSFO_PRICE
+    original_mgo = MGO_PRICE
+    
+    print("\n" + "="*60)
+    print("BUNKER PRICE SENSITIVITY ANALYSIS")
+    print("="*60)
+    
+    results = []
+    
+    for mult in np.linspace(price_range[0], price_range[1], steps):
+        VLSFO_PRICE = original_vlsfo * mult
+        MGO_PRICE = original_mgo * mult
+        
+        allocation = optimize_portfolio(verbose=False)
+        total_profit = allocation['profit'].sum()
+        
+        results.append({
+            'multiplier': mult,
+            'vlsfo_price': VLSFO_PRICE,
+            'total_profit': total_profit,
+            'allocation': allocation['cargo'].tolist()
+        })
+        
+        print(f"VLSFO ${VLSFO_PRICE:.0f}/MT ({mult:.0%}): Profit ${total_profit:,.0f}")
+    
+    # Restore original prices
+    VLSFO_PRICE = original_vlsfo
+    MGO_PRICE = original_mgo
+    
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == "__main__":
-    optimize_portfolio()
+    # Run optimization
+    optimal = optimize_portfolio(include_market_cargoes=True, verbose=True)
+    
+    # Show detailed breakdown
+    print("\n\nDETAILED VOYAGE BREAKDOWN:")
+    print("="*60)
+    
+    for _, row in optimal.iterrows():
+        if row['vessel'] != "MARKET CHARTER":
+            print(f"\n{row['vessel']} -> {row['cargo']}")
+            print(f"  Route: {row.get('route', 'N/A')}")
+            print(f"  Feasible: {row['is_feasible']} ({row.get('feasibility_notes', '')})")
+            print(f"  Distance: {row.get('dist_ballast', 0):,.0f} nm (ballast) + {row.get('dist_laden', 0):,.0f} nm (laden)")
+            print(f"  Duration: {row.get('total_days', 0):.1f} days")
+            print(f"  Revenue: ${row.get('revenue', 0):,.0f}")
+            print(f"  Costs: ${row.get('total_cost', 0):,.0f} (fuel: ${row.get('fuel_cost', 0):,.0f}, port: ${row.get('port_cost', 0):,.0f})")
+            print(f"  Profit: ${row['profit']:,.0f}")
+            print(f"  TCE: ${row.get('tce', 0):,.0f}/day")
+    
+    # Uncomment to run sensitivity analysis
+    # bunker_sensitivity_analysis()
