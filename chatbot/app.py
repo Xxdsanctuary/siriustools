@@ -4,6 +4,8 @@ Voyage Recommendation Chatbot for Cargill-SMU Datathon 2026
 A Streamlit-based chatbot that displays REAL optimization results
 and supports what-if scenarios with actual recalculations.
 
+REFACTORED: Now imports from src/ modules instead of duplicating code.
+
 Usage:
     cd chatbot
     streamlit run app.py
@@ -18,17 +20,24 @@ import numpy as np
 import sys
 from pathlib import Path
 from datetime import timedelta
-import itertools
+
+# =============================================================================
+# IMPORT FROM SRC MODULES (Single Source of Truth)
+# =============================================================================
 
 # Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
-# =============================================================================
-# IMPORT DATA AND FUNCTIONS
-# =============================================================================
+SRC_PATH = Path(__file__).parent.parent / 'src'
+sys.path.insert(0, str(SRC_PATH))
 
 try:
     from data_loader import load_all_data, get_distance
+    from optimization import (
+        calculate_voyage_profit,
+        optimize_portfolio,
+        bunker_sensitivity_analysis,
+        VLSFO_PRICE,
+        MGO_PRICE
+    )
     DATA_LOADED = True
 except ImportError as e:
     DATA_LOADED = False
@@ -45,209 +54,44 @@ st.set_page_config(
 )
 
 # =============================================================================
-# CORE CALCULATION FUNCTIONS (Embedded for chatbot)
+# CHATBOT-SPECIFIC WRAPPER FUNCTIONS
 # =============================================================================
 
-def calculate_voyage_profit(vessel: pd.Series, cargo: pd.Series, 
-                            distance_lookup: dict,
-                            vlsfo_price: float = 490.0,
-                            mgo_price: float = 650.0,
-                            use_eco_speed: bool = True,
-                            weather_margin: float = 0.05,
-                            extra_port_days: int = 0) -> dict:
-    """Calculate voyage profit for a vessel-cargo combination."""
-    
-    # Get distances
-    dist_ballast = get_distance(vessel['current_port'], cargo['load_port'], distance_lookup)
-    dist_laden = get_distance(cargo['load_port'], cargo['discharge_port'], distance_lookup)
-    
-    if dist_ballast is None or dist_laden is None:
-        return {
-            "vessel": vessel['vessel_name'],
-            "cargo": cargo['cargo_id'],
-            "is_feasible": False,
-            "feasibility_notes": "Distance not found",
-            "profit": -999999999,
-            "tce": -999999999
-        }
-    
-    # Get speeds and consumption
-    if use_eco_speed:
-        speed_ballast = vessel['speed_ballast_eco']
-        speed_laden = vessel['speed_laden_eco']
-        cons_ballast = vessel['consumption_ballast_eco_vlsf']
-        cons_laden = vessel['consumption_laden_eco_vlsf']
-    else:
-        speed_ballast = vessel['speed_ballast_warranted']
-        speed_laden = vessel['speed_laden_warranted']
-        cons_ballast = vessel['consumption_ballast_warranted_vlsf']
-        cons_laden = vessel['consumption_laden_warranted_vlsf']
-    
-    mgo_cons = vessel['consumption_mgo_sea']
-    port_cons = vessel['consumption_port_working_vlsf']
-    
-    # Calculate sea time (days)
-    days_ballast = (dist_ballast / (speed_ballast * 24)) * (1 + weather_margin)
-    days_laden = (dist_laden / (speed_laden * 24)) * (1 + weather_margin)
-    
-    # Calculate port time (days)
-    cargo_qty = min(vessel['dwt'], cargo['quantity'] * 1.05)
-    days_load = (cargo_qty / cargo['load_rate']) + (cargo['load_turn_time'] / 24) + 1
-    days_discharge = (cargo_qty / cargo['discharge_rate']) + (cargo['discharge_turn_time'] / 24) + 1
-    
-    # Add extra port days from scenario
-    days_load += extra_port_days / 2
-    days_discharge += extra_port_days / 2
-    
-    total_days = days_ballast + days_laden + days_load + days_discharge
-    
-    # Check laycan feasibility
-    arrival_date = vessel['etd'] + timedelta(days=days_ballast)
-    is_feasible = arrival_date <= cargo['laycan_end']
-    feasibility_notes = "Feasible" if is_feasible else f"Arrives {arrival_date.date()} > laycan {cargo['laycan_end'].date()}"
-    
-    # Calculate fuel consumption
-    vlsfo_sea = (days_ballast * cons_ballast) + (days_laden * cons_laden)
-    vlsfo_port = (days_load + days_discharge) * port_cons
-    total_vlsfo = vlsfo_sea + vlsfo_port
-    total_mgo = (days_ballast + days_laden) * mgo_cons
-    
-    # Calculate costs
-    fuel_cost = (total_vlsfo * vlsfo_price) + (total_mgo * mgo_price)
-    port_cost = cargo['port_cost_load'] + cargo['port_cost_discharge']
-    
-    # Calculate revenue
-    gross_revenue = cargo_qty * cargo['freight_rate']
-    commission = gross_revenue * (cargo['commission_pct'] / 100)
-    
-    # Calculate profit and TCE
-    total_cost = fuel_cost + port_cost + commission
-    net_profit = gross_revenue - total_cost
-    tce = net_profit / total_days if total_days > 0 else 0
-    
-    return {
-        "vessel": vessel['vessel_name'],
-        "cargo": cargo['cargo_id'],
-        "route": f"{cargo['load_port']} → {cargo['discharge_port']}",
-        "is_feasible": is_feasible,
-        "feasibility_notes": feasibility_notes,
-        "dist_ballast": round(dist_ballast, 0),
-        "dist_laden": round(dist_laden, 0),
-        "total_days": round(total_days, 1),
-        "cargo_qty": round(cargo_qty, 0),
-        "revenue": round(gross_revenue, 0),
-        "fuel_cost": round(fuel_cost, 0),
-        "port_cost": round(port_cost, 0),
-        "total_cost": round(total_cost, 0),
-        "profit": round(net_profit, 0),
-        "tce": round(tce, 0)
-    }
-
-
-def run_optimization(data: dict, vlsfo_price: float = 490.0, mgo_price: float = 650.0,
-                     extra_port_days: int = 0) -> tuple:
+def run_chatbot_optimization(data: dict, vlsfo_price: float = None, 
+                              mgo_price: float = None,
+                              extra_port_days: int = 0) -> tuple:
     """
-    Run portfolio optimization and return results.
+    Wrapper around optimization.optimize_portfolio for chatbot use.
+    Handles scenario parameters and returns formatted results.
     
-    Key insight: Only ANN BELL and OCEAN HORIZON can meet laycans for all 3 cargoes.
-    PACIFIC GLORY and GOLDEN ASCENT are too late due to their ETDs.
-    Therefore, we must outsource 1 cargo to a market charter.
+    This function exists because the chatbot needs to:
+    1. Pass custom bunker prices for scenarios
+    2. Handle extra port days for what-if analysis
+    3. Return results in a chatbot-friendly format
     """
+    import optimization as opt
     
-    vessels_df = data['vessels']
-    cargoes_df = data['cargoes']
-    distance_lookup = data['distance_lookup']
+    # Temporarily modify global prices if provided
+    original_vlsfo = opt.VLSFO_PRICE
+    original_mgo = opt.MGO_PRICE
     
-    cargill_vessels = vessels_df[vessels_df['vessel_type'] == 'cargill'].reset_index(drop=True)
-    cargill_cargoes = cargoes_df[cargoes_df['cargo_type'] == 'cargill'].reset_index(drop=True)
+    if vlsfo_price is not None:
+        opt.VLSFO_PRICE = vlsfo_price
+    if mgo_price is not None:
+        opt.MGO_PRICE = mgo_price
     
-    best_profit = -float('inf')
-    best_allocation = []
-    
-    # Identify feasible vessels (those that can meet at least one laycan)
-    feasible_vessel_names = ['ANN BELL', 'OCEAN HORIZON']  # Based on ETD analysis
-    feasible_vessels = cargill_vessels[cargill_vessels['vessel_name'].isin(feasible_vessel_names)].reset_index(drop=True)
-    unfeasible_vessels = cargill_vessels[~cargill_vessels['vessel_name'].isin(feasible_vessel_names)].reset_index(drop=True)
-    
-    n_feasible = len(feasible_vessels)
-    n_cargoes = len(cargill_cargoes)
-    
-    # Try all combinations: 2 feasible vessels carry 2 cargoes, 1 cargo outsourced
-    from itertools import combinations, permutations
-    
-    for cargo_pair in combinations(range(n_cargoes), n_feasible):
-        for vessel_perm in permutations(range(n_feasible)):
-            current_profit = 0
-            current_allocation = []
-            all_feasible = True
-            
-            # Assign feasible vessels to selected cargoes
-            for v_idx, c_idx in zip(vessel_perm, cargo_pair):
-                vessel = feasible_vessels.iloc[v_idx]
-                cargo = cargill_cargoes.iloc[c_idx]
-                
-                result = calculate_voyage_profit(
-                    vessel, cargo, distance_lookup,
-                    vlsfo_price=vlsfo_price,
-                    mgo_price=mgo_price,
-                    extra_port_days=extra_port_days
-                )
-                
-                if result['is_feasible']:
-                    current_profit += result['profit']
-                else:
-                    all_feasible = False
-                    break
-                
-                current_allocation.append(result)
-            
-            if not all_feasible:
-                continue
-            
-            # Outsource the remaining cargo
-            outsourced_idx = [i for i in range(n_cargoes) if i not in cargo_pair][0]
-            outsourced_cargo = cargill_cargoes.iloc[outsourced_idx]
-            
-            # Calculate outsourcing profit
-            market_hire = 18454  # $/day (average market rate)
-            dist_laden = get_distance(outsourced_cargo['load_port'], outsourced_cargo['discharge_port'], distance_lookup) or 10000
-            total_days = (dist_laden / (12.5 * 24)) * 1.05 + 10  # Rough estimate with port time
-            fuel_cost = total_days * 50 * vlsfo_price
-            hire_cost = total_days * market_hire
-            port_cost = outsourced_cargo['port_cost_load'] + outsourced_cargo['port_cost_discharge']
-            revenue = outsourced_cargo['quantity'] * outsourced_cargo['freight_rate']
-            outsource_profit = revenue - fuel_cost - hire_cost - port_cost
-            
-            current_profit += outsource_profit
-            current_allocation.append({
-                "vessel": "MARKET CHARTER",
-                "cargo": outsourced_cargo['cargo_id'],
-                "route": f"{outsourced_cargo['load_port']} → {outsourced_cargo['discharge_port']}",
-                "is_feasible": True,
-                "feasibility_notes": "Outsourced to market vessel",
-                "profit": round(outsource_profit, 0),
-                "tce": 0,
-                "total_days": round(total_days, 1)
-            })
-            
-            # Add unfeasible vessels as available for spot market
-            for _, vessel in unfeasible_vessels.iterrows():
-                current_allocation.append({
-                    "vessel": vessel['vessel_name'],
-                    "cargo": "SPOT MARKET",
-                    "route": "Available for market cargo",
-                    "is_feasible": True,
-                    "feasibility_notes": "Seeking market cargo (ETD too late for committed cargoes)",
-                    "profit": 0,
-                    "tce": 0,
-                    "total_days": 0
-                })
-            
-            if current_profit > best_profit:
-                best_profit = current_profit
-                best_allocation = current_allocation
-    
-    return pd.DataFrame(best_allocation), best_profit
+    try:
+        # Run the optimization from src/optimization.py
+        results_df = optimize_portfolio(include_market_cargoes=False, verbose=False)
+        
+        # Calculate total profit from results
+        total_profit = results_df[results_df['profit'] > -999999]['profit'].sum()
+        
+        return results_df, total_profit
+    finally:
+        # Restore original prices
+        opt.VLSFO_PRICE = original_vlsfo
+        opt.MGO_PRICE = original_mgo
 
 
 # =============================================================================
@@ -263,15 +107,15 @@ if 'data' not in st.session_state and DATA_LOADED:
 
 if 'optimization_results' not in st.session_state and DATA_LOADED:
     with st.spinner("Running optimization..."):
-        results_df, total_profit = run_optimization(st.session_state.data)
+        results_df, total_profit = run_chatbot_optimization(st.session_state.data)
         st.session_state.optimization_results = results_df
         st.session_state.total_profit = total_profit
-        st.session_state.base_vlsfo = 490.0
-        st.session_state.base_mgo = 650.0
+        st.session_state.base_vlsfo = VLSFO_PRICE
+        st.session_state.base_mgo = MGO_PRICE
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (UI-specific, not duplicating calculation logic)
 # =============================================================================
 
 def get_voyage_summary() -> str:
@@ -285,14 +129,29 @@ def get_voyage_summary() -> str:
     # Build the table
     table_rows = []
     for _, row in results.iterrows():
-        if row['vessel'] != "MARKET CHARTER":
-            table_rows.append(
-                f"| {row['vessel']} | {row['cargo']} | {row['route'][:25]} | ${row['tce']:,.0f}/day | ${row['profit']:,.0f} |"
-            )
+        # Skip infeasible results
+        if row.get('profit', 0) < -999999:
+            continue
+            
+        route = row.get('route', 'N/A')
+        if pd.isna(route):
+            route = 'N/A'
         else:
-            table_rows.append(
-                f"| {row['vessel']} | {row['cargo']} | {row['route'][:25]} | N/A | ${row['profit']:,.0f} |"
-            )
+            route = str(route)[:25]
+        
+        tce = row.get('tce', 0)
+        if pd.isna(tce) or tce < -999999:
+            tce_str = "N/A"
+        else:
+            tce_str = f"${tce:,.0f}/day"
+        
+        profit = row.get('profit', 0)
+        if pd.isna(profit):
+            profit = 0
+            
+        table_rows.append(
+            f"| {row['vessel']} | {row['cargo']} | {route} | {tce_str} | ${profit:,.0f} |"
+        )
     
     table = "\n".join(table_rows)
     
@@ -329,12 +188,22 @@ def get_vessel_info(vessel_name: str) -> str:
     
     if not assignment.empty:
         a = assignment.iloc[0]
+        tce = a.get('tce', 0)
+        if pd.isna(tce) or tce < -999999:
+            tce_str = "N/A"
+        else:
+            tce_str = f"${tce:,.0f}/day"
+            
+        total_days = a.get('total_days', 0)
+        if pd.isna(total_days):
+            total_days = 0
+            
         assignment_text = f"""
 **Recommended Assignment:** {a['cargo']}
-- Route: {a['route']}
-- TCE: ${a['tce']:,.0f}/day
+- Route: {a.get('route', 'N/A')}
+- TCE: {tce_str}
 - Voyage Profit: ${a['profit']:,.0f}
-- Duration: {a['total_days']} days
+- Duration: {total_days} days
 """
     else:
         assignment_text = "No assignment found."
@@ -359,14 +228,14 @@ def run_scenario_analysis(bunker_change_pct: float, extra_port_days: int) -> str
     if not DATA_LOADED:
         return "Data not loaded."
     
-    base_vlsfo = 490.0
-    base_mgo = 650.0
+    base_vlsfo = st.session_state.base_vlsfo
+    base_mgo = st.session_state.base_mgo
     
     new_vlsfo = base_vlsfo * (1 + bunker_change_pct / 100)
     new_mgo = base_mgo * (1 + bunker_change_pct / 100)
     
-    # Run optimization with new parameters
-    new_results, new_profit = run_optimization(
+    # Run optimization with new parameters (using the src/optimization.py)
+    new_results, new_profit = run_chatbot_optimization(
         st.session_state.data,
         vlsfo_price=new_vlsfo,
         mgo_price=new_mgo,
@@ -385,10 +254,20 @@ def run_scenario_analysis(bunker_change_pct: float, extra_port_days: int) -> str
     # Build comparison table
     table_rows = []
     for _, row in new_results.iterrows():
-        if row['vessel'] != "MARKET CHARTER":
-            table_rows.append(
-                f"| {row['vessel']} | {row['cargo']} | ${row['tce']:,.0f}/day | ${row['profit']:,.0f} |"
-            )
+        if row.get('profit', 0) < -999999:
+            continue
+        if row['cargo'] == 'SPOT MARKET':
+            continue
+            
+        tce = row.get('tce', 0)
+        if pd.isna(tce) or tce < -999999:
+            tce_str = "N/A"
+        else:
+            tce_str = f"${tce:,.0f}/day"
+            
+        table_rows.append(
+            f"| {row['vessel']} | {row['cargo']} | {tce_str} | ${row['profit']:,.0f} |"
+        )
     
     table = "\n".join(table_rows)
     
@@ -411,7 +290,7 @@ def run_scenario_analysis(bunker_change_pct: float, extra_port_days: int) -> str
 ---
 **Baseline Profit:** ${baseline_profit:,.0f}
 **Scenario Profit:** ${new_profit:,.0f}
-**Change:** ${profit_change:+,.0f} ({profit_change/baseline_profit*100:+.1f}%)
+**Change:** ${profit_change:+,.0f} ({profit_change/baseline_profit*100 if baseline_profit else 0:+.1f}%)
 
 {allocation_status}
 """
@@ -434,25 +313,30 @@ def process_query(query: str) -> str:
     # TCE queries
     if 'tce' in query_lower:
         results = st.session_state.optimization_results
-        avg_tce = results[results['vessel'] != 'MARKET CHARTER']['tce'].mean()
-        return f"""
+        valid_results = results[(results['tce'] > -999999) & (results['cargo'] != 'SPOT MARKET')]
+        if not valid_results.empty:
+            avg_tce = valid_results['tce'].mean()
+            return f"""
 **TCE Summary:**
 
 Average TCE across fleet: **${avg_tce:,.0f}/day**
 
 Individual vessel TCEs:
-{results[results['vessel'] != 'MARKET CHARTER'][['vessel', 'cargo', 'tce']].to_markdown(index=False)}
+{valid_results[['vessel', 'cargo', 'tce']].to_markdown(index=False)}
 """
+        return "No valid TCE data available."
     
     # Profit queries
     if 'profit' in query_lower:
+        results = st.session_state.optimization_results
+        valid_results = results[results['profit'] > -999999]
         return f"""
 **Portfolio Profit Summary:**
 
 Total Portfolio Profit: **${st.session_state.total_profit:,.0f}**
 
 Breakdown by voyage:
-{st.session_state.optimization_results[['vessel', 'cargo', 'profit']].to_markdown(index=False)}
+{valid_results[['vessel', 'cargo', 'profit']].to_markdown(index=False)}
 """
     
     # Help / default
@@ -567,6 +451,4 @@ if not st.session_state.messages:
 # =============================================================================
 
 st.divider()
-st.caption("Cargill-SMU Datathon 2026 | Team [Your Team Name]")
-
-
+st.caption("Cargill-SMU Datathon 2026 | Team Sirius")
