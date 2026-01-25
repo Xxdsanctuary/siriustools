@@ -3,7 +3,11 @@ Portfolio Optimization Engine for Cargill-SMU Datathon 2026
 ============================================================
 Optimizes vessel-cargo allocation to maximize total portfolio profit.
 
-Now uses data_loader.py for accurate vessel/cargo data from PPTX.
+Calculation methodology aligned with Simple calculator.xlsx:
+- Hire-based profit calculation
+- TCE = (Revenue - Bunker - Port) / Days
+- Includes 1 day bunkering time
+- Port time = cargo/rate + turn_time (in days) + 0.5 idle
 
 Author: Team Sirius
 Date: January 2026
@@ -41,6 +45,14 @@ print(f"VLSFO Price: ${VLSFO_PRICE}/MT")
 print(f"MGO Price: ${MGO_PRICE}/MT")
 
 # =============================================================================
+# CONSTANTS (from Excel calculator)
+# =============================================================================
+
+ADCOMS_PCT = 0.0375  # Address commission 3.75%
+BUNKER_DAYS = 1  # 1 day for bunkering
+PORT_IDLE_DAYS = 0.5  # 0.5 day idle at each port
+
+# =============================================================================
 # CALCULATION FUNCTIONS
 # =============================================================================
 
@@ -50,6 +62,10 @@ def calculate_voyage_profit(vessel: pd.Series, cargo: pd.Series,
                             extra_port_days: int = 0) -> dict:
     """
     Calculate voyage profit for a vessel-cargo combination.
+    
+    Methodology aligned with Simple calculator.xlsx:
+    - Profit = Revenue - Hire (net of ADCOMS) - Bunker - Port costs
+    - TCE = (Revenue - Bunker - Port) / Total Days
     
     Args:
         vessel: Series from vessels DataFrame
@@ -104,50 +120,69 @@ def calculate_voyage_profit(vessel: pd.Series, cargo: pd.Series,
     mgo_cons = vessel['consumption_mgo_sea']
     port_cons = vessel['consumption_port_working_vlsf']
     
-    # 3. Calculate sea time (days)
+    # 3. Calculate sea time (days) - KEEP 5% weather margin
     days_ballast = (dist_ballast / (speed_ballast * 24)) * (1 + weather_margin)
     days_laden = (dist_laden / (speed_laden * 24)) * (1 + weather_margin)
+    days_steaming = days_ballast + days_laden
     
-    # 4. Calculate port time (days)
+    # 4. Calculate port time (days) - CHANGED to match Excel
+    # Excel: cargo/rate + turn_time (in days) + idle (0.5 day)
     cargo_qty = min(vessel['dwt'], cargo['quantity'] * 1.05)  # Max within 5% tolerance
     
-    days_load = (cargo_qty / cargo['load_rate']) + (cargo['load_turn_time'] / 24)
-    days_discharge = (cargo_qty / cargo['discharge_rate']) + (cargo['discharge_turn_time'] / 24)
+    # Turn time is in hours in our data, convert to days
+    load_turn_time_days = cargo['load_turn_time'] / 24
+    discharge_turn_time_days = cargo['discharge_turn_time'] / 24
     
-    # Add 1 day buffer at each port for waiting
-    days_load += 1
-    days_discharge += 1
+    days_load = (cargo_qty / cargo['load_rate']) + load_turn_time_days + PORT_IDLE_DAYS
+    days_discharge = (cargo_qty / cargo['discharge_rate']) + discharge_turn_time_days + PORT_IDLE_DAYS
     
     # Add extra port days from scenario analysis (split between load and discharge)
     days_load += extra_port_days / 2
     days_discharge += extra_port_days / 2
     
-    total_days = days_ballast + days_laden + days_load + days_discharge
+    days_port = days_load + days_discharge
     
-    # 5. Check laycan feasibility
+    # 5. Total voyage duration - CHANGED: add bunkering day
+    total_days = days_steaming + BUNKER_DAYS + days_port
+    
+    # 6. Check laycan feasibility
     arrival_date = vessel['etd'] + timedelta(days=days_ballast)
     is_feasible = arrival_date <= cargo['laycan_end']
     feasibility_notes = "Feasible" if is_feasible else f"Arrives {arrival_date.date()} > laycan end {cargo['laycan_end'].date()}"
     
-    # 6. Calculate fuel consumption
-    vlsfo_sea = (days_ballast * cons_ballast) + (days_laden * cons_laden)
-    vlsfo_port = (days_load + days_discharge) * port_cons
-    total_vlsfo = vlsfo_sea + vlsfo_port
+    # 7. Calculate fuel consumption - CHANGED to match Excel
+    # At sea: different consumption for ballast vs laden
+    vlsfo_at_sea = (days_ballast * cons_ballast) + (days_laden * cons_laden)
+    mgo_at_sea = days_steaming * mgo_cons
     
-    total_mgo = (days_ballast + days_laden) * mgo_cons
+    # In port (including bunker day): use port consumption
+    vlsfo_in_port = (BUNKER_DAYS + days_port) * port_cons
+    mgo_in_port = (BUNKER_DAYS + days_port) * mgo_cons
     
-    # 7. Calculate costs
-    fuel_cost = (total_vlsfo * VLSFO_PRICE) + (total_mgo * MGO_PRICE)
+    total_vlsfo = vlsfo_at_sea + vlsfo_in_port
+    total_mgo = mgo_at_sea + mgo_in_port
+    
+    # 8. Calculate costs - CHANGED to match Excel
+    bunker_cost = (total_vlsfo * VLSFO_PRICE) + (total_mgo * MGO_PRICE)
     port_cost = cargo['port_cost_load'] + cargo['port_cost_discharge']
     
-    # 8. Calculate revenue
+    # Hire cost (Excel method)
+    daily_hire = vessel['hire_rate']
+    gross_hire = daily_hire * total_days
+    net_hire = gross_hire * (1 - ADCOMS_PCT)  # After address commission
+    
+    # 9. Calculate revenue
     gross_revenue = cargo_qty * cargo['freight_rate']
     commission = gross_revenue * (cargo['commission_pct'] / 100)
+    net_revenue = gross_revenue - commission
     
-    # 9. Calculate profit and TCE
-    total_cost = fuel_cost + port_cost + commission
+    # 10. Calculate profit and TCE - CHANGED to match Excel
+    # Profit = Revenue - Hire - Bunker - Port (charterer's profit)
+    total_cost = net_hire + bunker_cost + port_cost + commission
     net_profit = gross_revenue - total_cost
-    tce = net_profit / total_days if total_days > 0 else 0
+    
+    # TCE = (Revenue - Bunker - Port) / Days (Excel formula)
+    tce = (gross_revenue - bunker_cost - port_cost - commission) / total_days if total_days > 0 else 0
     
     return {
         "vessel": vessel['vessel_name'],
@@ -161,16 +196,19 @@ def calculate_voyage_profit(vessel: pd.Series, cargo: pd.Series,
         "dist_laden": round(dist_laden, 0),
         "days_ballast": round(days_ballast, 1),
         "days_laden": round(days_laden, 1),
-        "days_port": round(days_load + days_discharge, 1),
+        "days_port": round(days_port, 1),
         "total_days": round(total_days, 1),
         "cargo_qty": round(cargo_qty, 0),
         "revenue": round(gross_revenue, 0),
-        "fuel_cost": round(fuel_cost, 0),
+        "hire_cost": round(net_hire, 0),
+        "bunker_cost": round(bunker_cost, 0),
         "port_cost": round(port_cost, 0),
         "commission": round(commission, 0),
         "total_cost": round(total_cost, 0),
         "profit": round(net_profit, 0),
-        "tce": round(tce, 0)
+        "tce": round(tce, 0),
+        # Keep old field names for compatibility
+        "fuel_cost": round(bunker_cost, 0)
     }
 
 
@@ -275,7 +313,6 @@ def optimize_portfolio(include_market_cargoes: bool = True,
                 
                 result = calculate_voyage_profit(vessel, cargo, extra_port_days=extra_port_days)
                 
-                # Only count feasible voyages
                 if result['is_feasible']:
                     current_profit += result['profit']
                 else:
@@ -400,23 +437,7 @@ def bunker_sensitivity_analysis(price_range: tuple = (0.8, 1.3), steps: int = 10
 
 if __name__ == "__main__":
     # Run optimization
-    optimal = optimize_portfolio(include_market_cargoes=True, verbose=True)
+    results = optimize_portfolio(include_market_cargoes=False)
     
-    # Show detailed breakdown
-    print("\n\nDETAILED VOYAGE BREAKDOWN:")
-    print("="*60)
-    
-    for _, row in optimal.iterrows():
-        if row['vessel'] != "MARKET CHARTER":
-            print(f"\n{row['vessel']} -> {row['cargo']}")
-            print(f"  Route: {row.get('route', 'N/A')}")
-            print(f"  Feasible: {row['is_feasible']} ({row.get('feasibility_notes', '')})")
-            print(f"  Distance: {row.get('dist_ballast', 0):,.0f} nm (ballast) + {row.get('dist_laden', 0):,.0f} nm (laden)")
-            print(f"  Duration: {row.get('total_days', 0):.1f} days")
-            print(f"  Revenue: ${row.get('revenue', 0):,.0f}")
-            print(f"  Costs: ${row.get('total_cost', 0):,.0f} (fuel: ${row.get('fuel_cost', 0):,.0f}, port: ${row.get('port_cost', 0):,.0f})")
-            print(f"  Profit: ${row['profit']:,.0f}")
-            print(f"  TCE: ${row.get('tce', 0):,.0f}/day")
-    
-    # Uncomment to run sensitivity analysis
-    # bunker_sensitivity_analysis()
+    # Run sensitivity analysis
+    sensitivity = bunker_sensitivity_analysis()
