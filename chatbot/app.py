@@ -576,14 +576,11 @@ def format_comparison_output(cargill_result: Dict, mixed_result: Dict, improveme
     improvement = mixed_profit - cargill_profit
     improvement_pct = (improvement / cargill_profit * 100) if cargill_profit > 0 else 0
     
-    output = f"""
-<div class="better-option-box">
-<strong>🔄 ALTERNATIVE OPTIONS ANALYSIS</strong><br><br>
-
-<strong>Current Allocation (Cargill Fleet → Cargill Cargoes):</strong><br>
-Total Profit: <strong>${cargill_profit:,.0f}</strong><br><br>
-
-"""
+    # Build output using simple string concatenation to avoid f-string HTML issues
+    output = '<div class="better-option-box">'
+    output += '<strong>🔄 ALTERNATIVE OPTIONS ANALYSIS</strong><br><br>'
+    output += '<strong>Current Allocation (Cargill Fleet → Cargill Cargoes):</strong><br>'
+    output += f'Total Profit: <strong>${cargill_profit:,.0f}</strong><br><br>'
     
     if improvement > 50000:  # Significant improvement threshold
         output += f"""
@@ -596,15 +593,13 @@ Improvement: <strong>&dollar;{improvement:,.0f} (+{improvement_pct:.1f}%)</stron
 <strong>📈 SPECIFIC IMPROVEMENTS:</strong><br>
 """
         for imp in improvements:
-            output += f"• <strong>{imp['cargo']}</strong>: Switch from {imp['from_vessel']} to {imp['to_vessel']}<br>"
-            output += f"  TCE: ${imp['from_tce']:,.0f} → ${imp['to_tce']:,.0f} (+${imp['tce_gain']:,.0f}/day)<br>"
+            output += f'• <strong>{imp["cargo"]}</strong>: Switch from {imp["from_vessel"]} to {imp["to_vessel"]}<br>'
+            output += f'&nbsp;&nbsp;TCE: ${imp["from_tce"]:,.0f} → ${imp["to_tce"]:,.0f} (+${imp["tce_gain"]:,.0f}/day)<br>'
     else:
-        output += """
-<strong>✅ Current Cargill-only allocation is optimal or near-optimal.</strong><br>
-Mixed fleet offers minimal improvement.
-"""
+        output += '<strong>✅ Current Cargill-only allocation is optimal or near-optimal.</strong><br>'
+        output += 'Mixed fleet offers minimal improvement.'
     
-    output += "</div>"
+    output += '</div>'
     return output
 
 
