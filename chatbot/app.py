@@ -70,6 +70,19 @@ except ImportError:
     AI_LIMITATIONS = ""
 
 # =============================================================================
+# SECURITY GUARDRAILS (Constitution Enforcement)
+# =============================================================================
+
+try:
+    from guardrails import apply_guardrails, redact_sensitive_info, sanitize_ai_context
+    GUARDRAILS_AVAILABLE = True
+except ImportError:
+    GUARDRAILS_AVAILABLE = False
+    def apply_guardrails(query): return False, None
+    def redact_sensitive_info(text): return text
+    def sanitize_ai_context(context, max_length=2000): return context[:max_length]
+
+# =============================================================================
 # PAGE CONFIG & CARGILL STYLING
 # =============================================================================
 
@@ -1213,36 +1226,48 @@ if prompt := st.chat_input("Ask about voyage recommendations..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Check if AI mode is enabled
-    use_ai_mode = AI_AVAILABLE and st.session_state.get('ai_mode_enabled', False)
+    # ==========================================================================
+    # GUARDRAILS CHECK (Constitution Enforcement)
+    # ==========================================================================
+    is_blocked, refusal_response = apply_guardrails(prompt)
     
-    if use_ai_mode:
-        # AI-Enhanced Mode: Combine rule-based + AI
-        with st.spinner("🤖 AI is thinking..."):
-            # First get rule-based response for accuracy
-            rule_response, viz = process_query(prompt)
-            
-            # Check if rule-based gave a meaningful response (not just help text)
-            is_help_response = "I can help you with" in rule_response
-            
-            if is_help_response:
-                # Freeform query - let AI handle it
-                response, viz = process_freeform_query(
-                    prompt, 
-                    st.session_state,
-                    st.session_state.messages
-                )
-            else:
-                # Enhance rule-based response with AI summary
-                response, viz = process_with_ai_enhancement(
-                    prompt,
-                    rule_response,
-                    viz,
-                    st.session_state
-                )
+    if is_blocked:
+        # Query blocked by guardrails - return refusal response
+        response = refusal_response
+        viz = None
     else:
-        # Standard rule-based mode
-        response, viz = process_query(prompt)
+        # Query passed guardrails - proceed with normal processing
+        
+        # Check if AI mode is enabled
+        use_ai_mode = AI_AVAILABLE and st.session_state.get('ai_mode_enabled', False)
+        
+        if use_ai_mode:
+            # AI-Enhanced Mode: Combine rule-based + AI
+            with st.spinner("🤖 AI is thinking..."):
+                # First get rule-based response for accuracy
+                rule_response, viz = process_query(prompt)
+                
+                # Check if rule-based gave a meaningful response (not just help text)
+                is_help_response = "I can help you with" in rule_response
+                
+                if is_help_response:
+                    # Freeform query - let AI handle it
+                    response, viz = process_freeform_query(
+                        prompt, 
+                        st.session_state,
+                        st.session_state.messages
+                    )
+                else:
+                    # Enhance rule-based response with AI summary
+                    response, viz = process_with_ai_enhancement(
+                        prompt,
+                        rule_response,
+                        viz,
+                        st.session_state
+                    )
+        else:
+            # Standard rule-based mode
+            response, viz = process_query(prompt)
     
     msg = {"role": "assistant", "content": response}
     if viz:
