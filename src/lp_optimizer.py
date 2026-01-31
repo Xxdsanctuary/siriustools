@@ -34,6 +34,8 @@ class VoyageResult:
     vessel_type: str  # 'cargill' or 'market'
     cargo_type: str   # 'cargill' (committed) or 'market' (spot)
     route: str
+    load_port: str
+    discharge_port: str
     distance_nm: float
     sea_days: float
     port_days: float
@@ -168,6 +170,8 @@ class FleetOptimizer:
                 vessel_type=vessel_type,
                 cargo_type=cargo_type,
                 route=f"{load_port} → {discharge_port}",
+                load_port=load_port,
+                discharge_port=discharge_port,
                 distance_nm=distance,
                 sea_days=result.get('sea_days', 0),
                 port_days=result.get('port_days', 0),
@@ -189,6 +193,8 @@ class FleetOptimizer:
                 vessel_type=vessel_type,
                 cargo_type=cargo_type,
                 route=f"{load_port} → {discharge_port}",
+                load_port=load_port,
+                discharge_port=discharge_port,
                 distance_nm=distance,
                 sea_days=0, port_days=0, total_days=0,
                 revenue=0, hire_cost=0, bunker_cost=0, port_cost=0, commission=0,
