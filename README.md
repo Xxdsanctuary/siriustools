@@ -6,11 +6,11 @@
 
 | Name | Role | School |
 |------|------|--------|
-| Xxdsanctuary | Lead Developer | Software Engineering |
-| Nuza | Team Leader / Data Integrator | Information Systems |
-| Member 3 | Data Integrator | Information Systems |
-| Member 4 | Commercial Analyst | Business |
-| Member 5 | Commercial Analyst | Accountancy |
+| Steven | Lead Developer | Software Engineering |
+| Dewa | Team Leader | Information Systems |
+| Matthew | Data Integrator | Information Systems |
+| Chelsea | Commercial Analyst | Business |
+| Cindy | Commercial Analyst | Accountancy |
 
 ---
 
